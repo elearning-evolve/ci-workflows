@@ -1,0 +1,57 @@
+# Entry point for an ORGANIZATION RULESET ("Require workflows to pass before merging").
+# When this file is selected in an org ruleset, GitHub runs it on PRs in every targeted repo,
+# no file needed inside those repos.
+#
+# Ruleset workflows only fire on pull_request, pull_request_target and merge_group.
+# Pin @v1 to a tag in this central repo so a bad edit on main can't break every repo at once.
+
+name: WP QA (org required)
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: wp-qa-required-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  qa:
+    uses: elearning-evolve/ci-workflows/.github/workflows/wp-qa.yml@v1
+    with:
+      phpcs-scope: changed
+      fail-on-warnings: false
+
+  # Same as the caller file: ask for manual review only after every QA check is green.
+  request-review:
+    needs: qa
+    if: >-
+      github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Request manual review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          REVIEWER: adeel-raza
+        run: |
+          if [ "$AUTHOR" = "$REVIEWER" ]; then
+            echo "Reviewer opened this PR, skipping review request."
+            exit 0
+          fi
+          if gh api -X POST "repos/$REPO/pulls/$PR/requested_reviewers" -f "reviewers[]=$REVIEWER" >/dev/null 2>&1; then
+            gh pr comment "$PR" -R "$REPO" --body "All QA checks passed. Review requested from @$REVIEWER."
+          else
+            echo "::warning::Could not request review from $REVIEWER. Is $REVIEWER a collaborator on $REPO?"
+            gh pr comment "$PR" -R "$REPO" --body "All QA checks passed. Ready for review by @$REVIEWER." || true
+          fi

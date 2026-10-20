@@ -1,0 +1,266 @@
+# Reusable WordPress QA workflow.
+# Lives in ONE central repo (e.g. elearning-evolve/ci-workflows) and is called by every other repo.
+#
+# Jobs:
+#   1. php-lint  : PHP syntax check (php -l) on every PHP version in the matrix
+#   2. phpcs     : WordPress Coding Standards (WPCS 3.x) with inline PR annotations
+#
+# Works on any repo:
+#   - If the repo has its own phpcs.xml / phpcs.xml.dist / .phpcs.xml(.dist), that ruleset is used.
+#   - If the repo has composer.json with WPCS in require-dev, the repo's own PHPCS + WPCS versions are used.
+#   - Otherwise WPCS is installed on the fly and a default WordPress ruleset is generated.
+
+name: WP QA (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      php-versions:
+        description: 'JSON array of PHP versions to syntax check against. Put your minimum supported version first.'
+        type: string
+        default: '["7.4", "8.0", "8.1", "8.2", "8.3", "8.4"]'
+      tooling-php-version:
+        description: 'PHP version used to run PHPCS itself.'
+        type: string
+        default: '8.3'
+      exclude-paths:
+        description: 'Space separated directory names to skip (relative names, matched anywhere in the tree).'
+        type: string
+        default: 'vendor node_modules .git build dist'
+      phpcs-standard:
+        description: 'Standard used only when the repo has no phpcs.xml of its own. WordPress, WordPress-Core, WordPress-Extra or WordPress-Docs.'
+        type: string
+        default: 'WordPress'
+      phpcs-scope:
+        description: '"changed" checks only PHP files changed in the PR/push. "all" checks the whole repo.'
+        type: string
+        default: 'changed'
+      fail-on-warnings:
+        description: 'Fail the job on PHPCS warnings, not only errors.'
+        type: boolean
+        default: false
+      wpcs-version:
+        description: 'WPCS version constraint used when the repo does not pin its own.'
+        type: string
+        default: '^3.1'
+
+permissions:
+  contents: read
+
+jobs:
+  php-lint:
+    name: PHP syntax (${{ matrix.php }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(inputs.php-versions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+          ini-values: error_reporting=E_ALL, display_errors=On
+
+      - name: Lint all PHP files
+        env:
+          EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+        run: |
+          prune=()
+          for d in $EXCLUDE_PATHS; do
+            prune+=( -name "$d" -o )
+          done
+
+          if [ ${#prune[@]} -gt 0 ]; then
+            unset 'prune[${#prune[@]}-1]'   # drop trailing -o
+            find . \( -type d \( "${prune[@]}" \) -prune \) -o -type f -name '*.php' -print0 > "$RUNNER_TEMP/php-files"
+          else
+            find . -type f -name '*.php' -print0 > "$RUNNER_TEMP/php-files"
+          fi
+
+          count=$(tr -cd '\0' < "$RUNNER_TEMP/php-files" | wc -c)
+          echo "Checking $count PHP files on PHP $(php -r 'echo PHP_VERSION;')"
+          if [ "$count" -eq 0 ]; then
+            echo "No PHP files found, nothing to lint."
+            exit 0
+          fi
+
+          # Parallel lint. Only failures are printed. xargs exits non-zero if any file fails.
+          xargs -0 -n 20 -P "$(nproc)" sh -c '
+            rc=0
+            for f in "$@"; do
+              out=$(php -l "$f" 2>&1) || { echo "::error file=${f#./}::$out"; echo "$out"; rc=1; }
+            done
+            exit $rc
+          ' _ < "$RUNNER_TEMP/php-files"
+
+          echo "No syntax errors found."
+
+  phpcs:
+    name: WordPress coding standards
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed to diff against the base branch in "changed" mode
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.tooling-php-version }}
+          coverage: none
+          tools: composer, cs2pr
+
+      - name: Decide which PHPCS to use
+        id: tool
+        run: |
+          if [ -f composer.json ] && grep -q '"wp-coding-standards/wpcs"' composer.json; then
+            echo "source=project" >> "$GITHUB_OUTPUT"
+          else
+            echo "source=global" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get Composer cache dir
+        id: composer-cache
+        # --global so this works in repos with no composer.json
+        run: echo "dir=$(composer config --global cache-files-dir 2>/dev/null)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-${{ hashFiles('**/composer.lock', '**/composer.json') }}
+          restore-keys: composer-${{ runner.os }}-
+
+      - name: Install project dependencies (repo pins its own WPCS)
+        if: steps.tool.outputs.source == 'project'
+        run: |
+          composer install --no-interaction --prefer-dist --no-progress
+          echo "PHPCS_BIN=$PWD/vendor/bin/phpcs" >> "$GITHUB_ENV"
+
+      - name: Install WPCS globally (repo has no WPCS of its own)
+        if: steps.tool.outputs.source == 'global'
+        env:
+          WPCS_VERSION: ${{ inputs.wpcs-version }}
+        run: |
+          composer global config --no-interaction allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+          composer global require --no-interaction --no-progress \
+            "wp-coding-standards/wpcs:${WPCS_VERSION}" \
+            dealerdirect/phpcodesniffer-composer-installer
+          echo "PHPCS_BIN=$(composer global config bin-dir --absolute 2>/dev/null)/phpcs" >> "$GITHUB_ENV"
+
+      - name: Show installed standards
+        run: |
+          "$PHPCS_BIN" --version
+          "$PHPCS_BIN" -i
+
+      - name: Pick ruleset
+        env:
+          STANDARD: ${{ inputs.phpcs-standard }}
+          EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+        run: |
+          for f in .phpcs.xml phpcs.xml .phpcs.xml.dist phpcs.xml.dist; do
+            if [ -f "$f" ]; then
+              echo "Using repo ruleset: $f"
+              echo "PHPCS_RULESET=$f" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          echo "No ruleset in repo, generating default ($STANDARD)."
+          ruleset="$RUNNER_TEMP/phpcs-default.xml"
+          {
+            echo '<?xml version="1.0"?>'
+            echo '<ruleset name="Default WP QA">'
+            echo '  <arg name="extensions" value="php"/>'
+            echo '  <arg name="colors"/>'
+            echo '  <arg value="sp"/>'
+            echo '  <arg name="parallel" value="8"/>'
+            for d in $EXCLUDE_PATHS; do
+              echo "  <exclude-pattern>*/${d}/*</exclude-pattern>"
+            done
+            echo "  <rule ref=\"${STANDARD}\"/>"
+            echo '</ruleset>'
+          } > "$ruleset"
+          cat "$ruleset"
+          echo "PHPCS_RULESET=$ruleset" >> "$GITHUB_ENV"
+
+      - name: Collect files to check
+        id: files
+        env:
+          SCOPE: ${{ inputs.phpcs-scope }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          list="$RUNNER_TEMP/phpcs-files.txt"
+          : > "$list"
+
+          base=""
+          if [ "$SCOPE" = "changed" ]; then
+            case "$EVENT" in
+              pull_request|pull_request_target) base="$PR_BASE" ;;
+              merge_group) base="$MG_BASE" ;;
+              push)
+                # New branches send all zeros as "before", fall back to a full scan.
+                if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+                  base="$PUSH_BEFORE"
+                fi
+                ;;
+            esac
+          fi
+
+          mode=all
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git diff --name-only --diff-filter=ACMR "$base"...HEAD -- '*.php' > "$list" || true
+            mode=changed
+            echo "Changed PHP files: $(wc -l < "$list")"
+          else
+            echo "Full scan."
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = "changed" ] && [ ! -s "$list" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run PHPCS
+        if: steps.files.outputs.skip != 'true'
+        env:
+          FAIL_ON_WARNINGS: ${{ inputs.fail-on-warnings }}
+          MODE: ${{ steps.files.outputs.mode }}
+          LIST: ${{ steps.files.outputs.list }}
+        run: |
+          args=( --standard="$PHPCS_RULESET" --basepath=. -q --report-full --report-checkstyle="$RUNNER_TEMP/phpcs.xml" )
+          if [ "$FAIL_ON_WARNINGS" != "true" ]; then
+            args+=( --runtime-set ignore_warnings_on_exit 1 )
+          fi
+
+          if [ "$MODE" = "changed" ]; then
+            args+=( --file-list="$LIST" )
+          else
+            args+=( . )
+          fi
+
+          set +e
+          "$PHPCS_BIN" "${args[@]}"
+          rc=$?
+          set -e
+
+          # Inline annotations on the PR diff. Never let cs2pr decide pass/fail, PHPCS does.
+          if [ -s "$RUNNER_TEMP/phpcs.xml" ]; then
+            cs2pr --graceful-warnings "$RUNNER_TEMP/phpcs.xml" || true
+          fi
+
+          exit $rc
+
+      - name: Nothing to check
+        if: steps.files.outputs.skip == 'true'
+        run: echo "No PHP files changed, PHPCS skipped."
