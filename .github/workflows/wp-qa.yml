@@ -39,6 +39,10 @@ on:
         description: 'Fail the job on PHPCS warnings, not only errors.'
         type: boolean
         default: false
+      phpcs-exclude:
+        description: 'Space separated sniff or message codes to switch off on top of the standard (or the repo ruleset).'
+        type: string
+        default: 'Squiz.Commenting.InlineComment.InvalidEndChar Generic.Commenting.DocComment.ShortNotCapital Squiz.Commenting.FileComment Squiz.PHP.NonExecutableCode.ReturnNotRequired WordPress.PHP.YodaConditions Universal.Files.SeparateFunctionsFromOO.Mixed'
       wpcs-version:
         description: 'WPCS version constraint used when the repo does not pin its own.'
         type: string
@@ -161,32 +165,40 @@ jobs:
         env:
           STANDARD: ${{ inputs.phpcs-standard }}
           EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+          PHPCS_EXCLUDE: ${{ inputs.phpcs-exclude }}
         run: |
+          OUT_DIR="$RUNNER_TEMP"
+          REPO_RULESET=""
           for f in .phpcs.xml phpcs.xml .phpcs.xml.dist phpcs.xml.dist; do
-            if [ -f "$f" ]; then
-              echo "Using repo ruleset: $f"
-              echo "PHPCS_RULESET=$f" >> "$GITHUB_ENV"
-              exit 0
-            fi
+            [ -f "$f" ] && { REPO_RULESET="$f"; break; }
           done
-
-          echo "No ruleset in repo, generating default ($STANDARD)."
-          ruleset="$RUNNER_TEMP/phpcs-default.xml"
+          RULESET="$OUT_DIR/phpcs-wpqa.xml"
           {
             echo '<?xml version="1.0"?>'
-            echo '<ruleset name="Default WP QA">'
-            echo '  <arg name="extensions" value="php"/>'
-            echo '  <arg name="colors"/>'
-            echo '  <arg value="sp"/>'
-            echo '  <arg name="parallel" value="8"/>'
-            for d in $EXCLUDE_PATHS; do
-              echo "  <exclude-pattern>*/${d}/*</exclude-pattern>"
+            echo '<ruleset name="WP QA">'
+            if [ -n "$REPO_RULESET" ]; then
+              echo "Using repo ruleset: $REPO_RULESET (plus pipeline excludes)" >&2
+              echo "  <rule ref=\"$PWD/$REPO_RULESET\">"
+            else
+              echo "No ruleset in repo, using $STANDARD (plus pipeline excludes)" >&2
+              echo '  <arg name="extensions" value="php"/>'
+              echo '  <arg value="sp"/>'
+              echo '  <arg name="parallel" value="8"/>'
+              for d in $EXCLUDE_PATHS; do echo "  <exclude-pattern>*/${d}/*</exclude-pattern>"; done
+              echo "  <rule ref=\"$STANDARD\">"
+            fi
+            installed=" Generic Squiz PEAR PSR1 PSR2 PSR12 Zend MySource $("$PHPCS_BIN" -i | sed -e 's/.*are //' -e 's/ and /, /' | tr -d ',') "
+            for s in $PHPCS_EXCLUDE; do
+              case "$installed" in
+                *" ${s%%.*} "*) echo "    <exclude name=\"$s\"/>" ;;
+                *) echo "Skip exclude $s (standard ${s%%.*} not installed)" >&2 ;;
+              esac
             done
-            echo "  <rule ref=\"${STANDARD}\"/>"
+            echo '  </rule>'
             echo '</ruleset>'
-          } > "$ruleset"
-          cat "$ruleset"
-          echo "PHPCS_RULESET=$ruleset" >> "$GITHUB_ENV"
+          } > "$RULESET"
+          cat "$RULESET" >&2
+          echo "PHPCS_RULESET=$RULESET" >> "$GITHUB_ENV"
 
       - name: Collect files to check
         id: files
