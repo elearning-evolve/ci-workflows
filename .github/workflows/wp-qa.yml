@@ -30,7 +30,7 @@ on:
       phpcs-standard:
         description: 'Standard used only when the repo has no phpcs.xml of its own. WordPress, WordPress-Core, WordPress-Extra or WordPress-Docs.'
         type: string
-        default: 'WordPress'
+        default: 'WordPress-Extra'
       phpcs-scope:
         description: '"changed" checks only PHP files changed in the PR/push. "all" checks the whole repo.'
         type: string
@@ -42,7 +42,7 @@ on:
       phpcs-exclude:
         description: 'Space separated sniff or message codes to switch off on top of the standard (or the repo ruleset).'
         type: string
-        default: 'Squiz.Commenting.InlineComment.InvalidEndChar Generic.Commenting.DocComment.ShortNotCapital Squiz.Commenting.FileComment Squiz.PHP.NonExecutableCode.ReturnNotRequired WordPress.PHP.YodaConditions Universal.Files.SeparateFunctionsFromOO.Mixed'
+        default: 'Squiz.Commenting.InlineComment.InvalidEndChar Generic.Commenting.DocComment.ShortNotCapital Squiz.Commenting.FileComment Squiz.PHP.NonExecutableCode.ReturnNotRequired WordPress.PHP.YodaConditions Universal.Files.SeparateFunctionsFromOO.Mixed Squiz.Commenting Generic.Commenting.DocComment WordPress.WP.I18n.MissingTranslatorsComment WordPress.WP.CapitalPDangit Universal.Operators.DisallowShortTernary Universal.Operators.DisallowStandalonePostIncrementDecrement Universal.ControlStructures.DisallowLonelyIf'
       wpcs-version:
         description: 'WPCS version constraint used when the repo does not pin its own.'
         type: string
